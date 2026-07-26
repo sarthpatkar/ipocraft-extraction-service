@@ -78,6 +78,20 @@ class RhpExtractor:
             text += self.doc[i].get_text() + "\n"
         return text
 
+    def find_pages_with_keywords(self, keywords: List[str], max_pages: int = 5) -> str:
+        """Locates pages containing any of the given keywords and returns combined text."""
+        combined_text = ""
+        count = 0
+        for i, page in enumerate(self.doc):
+            txt = page.get_text()
+            txt_upper = txt.upper()
+            if any(kw.upper() in txt_upper for kw in keywords):
+                combined_text += txt + "\n"
+                count += 1
+                if count >= max_pages:
+                    break
+        return combined_text
+
     def stage_1_cover_page(self) -> Dict[str, Any]:
         """Extract cover page details from first 15 pages."""
         cover_text = self.get_combined_page_text(0, 15)
@@ -131,7 +145,6 @@ class RhpExtractor:
             self.confidence["price_min"] = 0.96
             self.confidence["price_max"] = 0.96
         else:
-            # Fixed price IPO check
             fixed_price = re.search(fr'(?:Issue\s+Price|Offer\s+Price)\s+(?:of\s+)?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_text, re.IGNORECASE)
             if fixed_price:
                 fields["price_min"] = fixed_price.group(1)
@@ -163,7 +176,6 @@ class RhpExtractor:
         """Extract Terms & Lot details."""
         fields = {}
         
-        # Scan pages 0 to 120 for Lot Size and Issue Size
         for page_num in range(min(120, len(self.doc))):
             text = self.doc[page_num].get_text()
             
@@ -226,34 +238,10 @@ class RhpExtractor:
 
         return fields
 
-    async def stage_5_ai_prompts(self, supabase_client: Any) -> Dict[str, Any]:
-        """AI fallback extraction for missing fields using Groq API."""
+    async def call_groq_ai(self, prompt: str) -> Dict[str, Any]:
+        """Calls Groq API and returns parsed JSON object."""
         if not self.groq_key:
-            print("[Stage 5 AI Note]: GROQ_API_KEY is missing. Skipping AI stage.")
             return {}
-
-        fields = {}
-        sample_text = self.get_combined_page_text(0, 15)
-
-        prompt = (
-            "You are an expert IPO data extractor. Extract core IPO details from this RHP text.\n"
-            "Return a JSON object with these keys (use null if not found):\n"
-            "{\n"
-            '  "name": "Full company name",\n'
-            '  "exchange": "NSE, BSE or NSE, BSE",\n'
-            '  "price_min": "Lower price band as number",\n'
-            '  "price_max": "Upper price band as number",\n'
-            '  "lot_size": "Lot size bid quantity as number",\n'
-            '  "face_value": "Face value as number",\n'
-            '  "open_date": "Issue open date",\n'
-            '  "close_date": "Issue close date",\n'
-            '  "about_company": "2 sentence business summary",\n'
-            '  "lead_managers": "Book running lead managers",\n'
-            '  "registrar": "Registrar to the issue"\n'
-            "}\n\n"
-            f"RHP Text:\n{sample_text[:15000]}"
-        )
-        
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(
@@ -265,19 +253,93 @@ class RhpExtractor:
                         "temperature": 0.1,
                         "response_format": {"type": "json_object"}
                     },
-                    timeout=25.0
+                    timeout=30.0
                 )
                 if res.status_code == 200:
                     data = res.json()
                     content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
-                    for k, v in parsed.items():
-                        if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
-                            fields[k] = str(v)
+                    return json.loads(content)
                 else:
-                    print(f"[Stage 5 AI Warning]: Groq returned status {res.status_code}: {res.text[:200]}")
+                    print(f"[AI Warning]: Groq status {res.status_code}: {res.text[:150]}")
         except Exception as e:
-            print(f"[Stage 5 AI Error]: {e}")
+            print(f"[AI Error]: {e}")
+        return {}
+
+    async def stage_5_ai_prompts(self, supabase_client: Any) -> Dict[str, Any]:
+        """Comprehensive AI extraction across targeted RHP sections."""
+        if not self.groq_key:
+            print("[Stage 5 AI Note]: GROQ_API_KEY is missing in environment.")
+            return {}
+
+        fields = {}
+
+        # Prompt A: Cover / Offer Details (if price_max or lot_size or name is missing)
+        cover_text = self.get_combined_page_text(0, 15)
+        terms_text = self.find_pages_with_keywords(["PRICE BAND", "LOT SIZE", "MINIMUM BID", "TERMS OF THE ISSUE"])
+        
+        prompt_cover = (
+            "Extract IPO details from this RHP text. Return a JSON object with these keys (use null if not found):\n"
+            "{\n"
+            '  "name": "Company name",\n'
+            '  "exchange": "NSE, BSE or NSE, BSE",\n'
+            '  "price_min": "Lower price band number",\n'
+            '  "price_max": "Upper price band number",\n'
+            '  "lot_size": "Lot size number",\n'
+            '  "face_value": "Face value number",\n'
+            '  "issue_size": "Total issue size in Crores",\n'
+            '  "fresh_issue": "Fresh issue in Crores",\n'
+            '  "open_date": "Open date YYYY-MM-DD",\n'
+            '  "close_date": "Close date YYYY-MM-DD",\n'
+            '  "lead_managers": "Lead managers",\n'
+            '  "registrar": "Registrar name"\n'
+            "}\n\n"
+            f"RHP Text:\n{cover_text[:10000]}\n{terms_text[:10000]}"
+        )
+        res_a = await self.call_groq_ai(prompt_cover)
+        for k, v in res_a.items():
+            if v is not None and str(v).strip() != "":
+                fields[k] = str(v)
+
+        # Prompt B: Financials & Shareholding
+        fin_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "SHAREHOLDING PATTERN", "STATEMENT OF FINANCIAL"])
+        if fin_text:
+            prompt_fin = (
+                "Extract financial metrics from this RHP text. Return a JSON object with these keys (use null if not found):\n"
+                "{\n"
+                '  "eps_pre": "Pre-issue EPS number",\n'
+                '  "eps_post": "Post-issue EPS number",\n'
+                '  "pe_pre": "Pre-issue P/E ratio number",\n'
+                '  "pe_post": "Post-issue P/E ratio number",\n'
+                '  "promoter_holding_pre": "Pre-issue promoter %",\n'
+                '  "promoter_holding_post": "Post-issue promoter %",\n'
+                '  "reservation_qib": "QIB reservation %",\n'
+                '  "reservation_nii": "NII reservation %",\n'
+                '  "reservation_rii": "Retail reservation %",\n'
+                '  "roce": "ROCE %",\n'
+                '  "pat_margin": "PAT Margin %"\n'
+                "}\n\n"
+                f"Financial Text:\n{fin_text[:12000]}"
+            )
+            res_b = await self.call_groq_ai(prompt_fin)
+            for k, v in res_b.items():
+                if v is not None and str(v).strip() != "":
+                    fields[k] = str(v)
+
+        # Prompt C: Narrative (About & Objectives)
+        biz_text = self.find_pages_with_keywords(["OUR BUSINESS", "OBJECTS OF THE ISSUE"], max_pages=3)
+        if biz_text:
+            prompt_nav = (
+                "Extract business narrative from this RHP text. Return a JSON object with these keys (use null if not found):\n"
+                "{\n"
+                '  "about_company": "2 sentence summary of business",\n'
+                '  "objectives": "Numbered list of IPO proceed uses"\n'
+                "}\n\n"
+                f"Business Text:\n{biz_text[:10000]}"
+            )
+            res_c = await self.call_groq_ai(prompt_nav)
+            for k, v in res_c.items():
+                if v is not None and str(v).strip() != "":
+                    fields[k] = str(v)
 
         return fields
 
@@ -323,6 +385,7 @@ class RhpExtractor:
 
         self.verify_registrar(supabase_client)
 
+        # Stage 5 multi-section AI prompts
         s5 = await self.stage_5_ai_prompts(supabase_client)
         self.extracted_fields.update(s5)
 
