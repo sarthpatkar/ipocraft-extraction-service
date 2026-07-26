@@ -2,11 +2,9 @@ import re
 import fitz  # PyMuPDF
 import json
 import asyncio
-import httpx
 from typing import Dict, Any, Tuple, List, Optional
-from difflib import SequenceMatcher
 
-WORKER_VERSION = "2.1.0"
+WORKER_VERSION = "3.2.0-zero-ai"
 CURRENCY_REGEX = r'(?:Rs\.?|INR|₹|Rupees?)'
 
 # ── SEBI Lot Math Helper (100% Deterministic) ────────────────────────────
@@ -51,13 +49,37 @@ def calculate_sebi_lots(price_max: float, lot_size: float) -> Dict[str, Any]:
     
     return {**retail, **shni, **bhni}
 
+def extract_company_name_from_cin_block(block_text: str) -> str:
+    """Extracts clean active legal company name from CIN block across multiline blocks."""
+    if not block_text:
+        return ""
+    # Strip former name parentheticals across full multiline block first!
+    clean_block = re.sub(r'\s*\((?:FORMERLY|formerly)\s+KNOWN\s+AS[^\)]+\)', '', block_text, flags=re.IGNORECASE)
+    clean_block = re.sub(r'\s*\([^)]*PRIVATE\s+LIMITED[^\)]*\)', '', clean_block, flags=re.IGNORECASE)
+    clean_block = re.sub(r'\s*\([^)]*LIMITED[^\)]*\)', '', clean_block, flags=re.IGNORECASE)
+    clean_block = re.sub(r'\s*\([^)]*LTD[^\)]*\)', '', clean_block, flags=re.IGNORECASE)
+
+    lines = [l.strip() for l in clean_block.split('\n') if l.strip()]
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if re.search(r'^(?:CORPORATE|REGISTERED|RED\s+HERRING|PROSPECTUS|DATED|READ|SECTION|100%|ISSUE|DETAILS)', line, re.IGNORECASE):
+            continue
+        if len(line) >= 4 and ("LIMITED" in line.upper() or "LTD" in line.upper()):
+            return line.strip()
+            
+    for line in reversed(lines):
+        if len(line) >= 4 and not re.search(r'^(?:CORPORATE|REGISTERED|RED|HERRING|PROSPECTUS|DATED|READ)', line, re.IGNORECASE):
+            return line.strip()
+            
+    return lines[-1] if lines else ""
+
 class RhpExtractor:
     def __init__(self, pdf_bytes: bytes, groq_api_key: Optional[str] = None):
         self.doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        self.groq_key = groq_api_key
         self.extracted_fields: Dict[str, Any] = {}
         self.warnings: List[str] = []
         self.confidence: Dict[str, float] = {}
+        self.toc_map: Dict[str, int] = {}
 
     def stage_0_triage(self) -> None:
         """Check if PDF is text-based or scanned image."""
@@ -72,322 +94,224 @@ class RhpExtractor:
         if len(total_text.strip()) < 50:
             raise ValueError("This PDF appears to be a scanned image document. Please upload a text-searchable digital PDF from SEBI EDGAR.")
 
-    def get_combined_page_text(self, start_page: int, end_page: int) -> str:
-        """Combines PyMuPDF plain text for a range of pages."""
-        text = ""
-        for i in range(start_page, min(end_page, len(self.doc))):
-            text += self.doc[i].get_text() + "\n"
-        return text
-
-    def find_pages_with_keywords(self, keywords: List[str], max_pages: int = 5) -> str:
-        """Locates pages containing any of the given keywords and returns combined text."""
-        combined_text = ""
-        count = 0
-        for i, page in enumerate(self.doc):
-            txt = page.get_text()
-            txt_upper = txt.upper()
-            if any(kw.upper() in txt_upper for kw in keywords):
-                combined_text += txt + "\n"
-                count += 1
-                if count >= max_pages:
-                    break
-        return combined_text
-
-    def stage_1_cover_page(self) -> Dict[str, Any]:
-        """Extract cover page details (pages 0-15). Handles multi-BRLM formatting."""
-        cover_text = self.get_combined_page_text(0, 15)
-        fields = {}
+    def stage_1_toc_map_engine(self) -> Dict[str, int]:
+        """Parses SEBI Table of Contents (pages 2-10) to map chapter page numbers."""
+        toc_map = {}
+        section_synonyms = {
+            "GENERAL_INFO": ["GENERAL INFORMATION", "SECTION I – GENERAL", "SECTION I - GENERAL"],
+            "CAPITAL_STRUCTURE": ["CAPITAL STRUCTURE"],
+            "OBJECTS": ["OBJECTS OF THE ISSUE", "OBJECTS OF THE OFFER", "OBJECTS OF THE ISSUE/OFFER"],
+            "BASIS_FOR_PRICE": ["BASIS FOR ISSUE PRICE", "BASIS FOR OFFER PRICE", "BASIS OF OFFER PRICE", "BASIS OF ISSUE PRICE"],
+            "BUSINESS": ["OUR BUSINESS", "OUR INDUSTRY AND BUSINESS"],
+            "RISK_FACTORS": ["RISK FACTORS", "SUMMARY OF RISK FACTORS"]
+        }
         
-        # 1. Company Name
-        name_match = re.search(
-            r'(?:PUBLIC\s+ISSUE|OFFERING|PROSPECTUS|EQUITY\s+SHARES|INITIAL\s+PUBLIC\s+OFFER)\s+(?:OF\s+)?(?:UP\s+TO\s+[\d,]+\s+EQUITY\s+SHARES\s+OF\s+)?([A-Z0-9\s\.\&\(\)\-]+?\b(?:LIMITED|LTD|PRIVATE\s+LIMITED|PVT\s+LTD))\b',
-            cover_text,
-            re.IGNORECASE
-        )
-        if not name_match:
-            name_match = re.search(r'([A-Z0-9\s\.\&\(\)\-]+?\b(?:LIMITED|LTD|PRIVATE\s+LIMITED|PVT\s+LTD))\b', cover_text)
-        if name_match:
-            raw_name = name_match.group(1).strip()
-            clean_name = re.sub(r'\s+(?:HAVING|REGISTERED|OUR\s+COMPANY|WAS\s+INCORPORATED).*$', '', raw_name, flags=re.IGNORECASE)
-            fields["name"] = clean_name.strip()
-            self.confidence["name"] = 0.95
+        for pg in range(1, min(12, len(self.doc))):
+            txt = self.doc[pg].get_text()
+            lines = txt.split('\n')
+            for line in lines:
+                m = re.search(r'([A-Z\s\–\-\:\(\)]{4,70})\s*[\.\s]{4,}\s*(\d{1,4})', line)
+                if m:
+                    sec_title = m.group(1).strip().upper()
+                    pnum = int(m.group(2))
+                    if 1 <= pnum <= len(self.doc):
+                        for sec_key, syns in section_synonyms.items():
+                            if sec_key not in toc_map and any(syn in sec_title for syn in syns):
+                                toc_map[sec_key] = pnum
+
+        self.toc_map = toc_map
+        return toc_map
+
+    def stage_2_cover_page_and_contacts(self) -> Dict[str, Any]:
+        """Extract cover page parameters and issuer/registrar contacts."""
+        p1_text = self.doc[0].get_text()
+        fields = {}
+
+        # 1. Company Name (CIN Anchor + Smart Multiline Parenthetical Bypasser)
+        cin_m = re.search(r'([A-Z0-9\s\.\&\(\)\-\,\'\"]+?)\n\s*(?:CORPORATE\s+IDENTI|CIN\b)', p1_text, re.IGNORECASE)
+        if cin_m:
+            extracted_name = extract_company_name_from_cin_block(cin_m.group(1))
+            if extracted_name:
+                fields["name"] = extracted_name
+                self.confidence["name"] = 0.99
+
+        if "name" not in fields:
+            name_m = re.search(r'(?:PUBLIC\s+ISSUE|OFFERING|PROSPECTUS|EQUITY\s+SHARES|INITIAL\s+PUBLIC\s+OFFER)\s+(?:OF\s+)?(?:UP\s+TO\s+[\d,]+\s+EQUITY\s+SHARES\s+OF\s+)?([A-Z0-9\s\.\&\(\)\-]+?\b(?:LIMITED|LTD|PRIVATE\s+LIMITED|PVT\s+LTD))\b', p1_text, re.IGNORECASE)
+            if name_m:
+                fields["name"] = extract_company_name_from_cin_block(name_m.group(1))
 
         # 2. Exchange
-        if re.search(r'\bBSE\b', cover_text) and re.search(r'\bNSE\b', cover_text):
+        cover_15 = ""
+        for i in range(min(15, len(self.doc))):
+            cover_15 += self.doc[i].get_text() + "\n"
+
+        if re.search(r'\bBSE\b', cover_15) and re.search(r'\bNSE\b', cover_15):
             fields["exchange"] = "NSE, BSE"
-        elif re.search(r'\bBSE\b', cover_text):
+        elif re.search(r'\bBSE\b', cover_15):
             fields["exchange"] = "BSE"
-        elif re.search(r'\bNSE\b', cover_text):
+        elif re.search(r'\bNSE\b', cover_15):
             fields["exchange"] = "NSE"
         self.confidence["exchange"] = 0.99
 
         # 3. IPO Type
-        if re.search(r'SME\s+INITIAL\s+PUBLIC|SME\s+PLATFORM|EMERGE|CHAPTER\s+IX', cover_text, re.IGNORECASE):
+        if re.search(r'SME\s+INITIAL\s+PUBLIC|SME\s+PLATFORM|EMERGE|CHAPTER\s+IX', cover_15, re.IGNORECASE):
             fields["ipo_type"] = "sme"
         else:
             fields["ipo_type"] = "mainboard"
         self.confidence["ipo_type"] = 0.99
 
         # 4. Face Value
-        fv_match = re.search(fr'(?:Face\s+Value|Nominal\s+Value)[^\n]*?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_text, re.IGNORECASE)
-        if fv_match:
-            fields["face_value"] = fv_match.group(1)
+        fv_m = re.search(r'(?:face\s+value|nominal\s+value)\s+of\s+(?:Rs\.?|INR|₹)?\s*(\d+(?:\.\d+)?)', p1_text, re.IGNORECASE)
+        if fv_m:
+            fields["face_value"] = fv_m.group(1)
             self.confidence["face_value"] = 0.98
 
         # 5. Price Band / Offer Price
-        price_band = re.search(
-            fr'(?:Price\s+Band|Offer\s+Price|Issue\s+Price)[^\n]*?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)\s*(?:to|-|–|AND)\s*{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)',
-            cover_text,
-            re.IGNORECASE
-        )
-        if not price_band:
-            price_band = re.search(fr'{CURRENCY_REGEX}\s*(\d+(?:\.\d+)?)\s*(?:to|-|–)\s*{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_text, re.IGNORECASE)
-
-        if price_band:
-            fields["price_min"] = price_band.group(1)
-            fields["price_max"] = price_band.group(2)
-            self.confidence["price_min"] = 0.96
-            self.confidence["price_max"] = 0.96
+        pb_m = re.search(fr'(?:Price\s+Band|Offer\s+Price|Issue\s+Price)[^\n]*?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)\s*(?:to|-|–|AND)\s*{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_15, re.IGNORECASE)
+        if pb_m:
+            fields["price_min"] = pb_m.group(1)
+            fields["price_max"] = pb_m.group(2)
         else:
-            fixed_price = re.search(fr'(?:Issue\s+Price|Offer\s+Price)\s+(?:of\s+)?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_text, re.IGNORECASE)
-            if fixed_price:
-                fields["price_min"] = fixed_price.group(1)
-                fields["price_max"] = fixed_price.group(1)
-                self.confidence["price_min"] = 0.95
-                self.confidence["price_max"] = 0.95
+            fixed_p = re.search(fr'(?:Issue\s+Price|Offer\s+Price)\s+(?:of\s+)?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)', cover_15, re.IGNORECASE)
+            if fixed_p:
+                fields["price_min"] = fixed_p.group(1)
+                fields["price_max"] = fixed_p.group(1)
+            elif "[●]" in p1_text or "[•]" in p1_text:
+                self.warnings.append("Price Band is omitted ([●]) in official SEBI filing — enter once Price Band Notice is published.")
 
-        # 6. Issue Dates
-        open_match = re.search(r'(?:BID/ISSUE\s+OPENS?|OPENS?\s+ON)\s*[:\-]?\s*([A-Za-z0-9\s,]+?\d{4})', cover_text, re.IGNORECASE)
-        if open_match:
-            fields["open_date"] = open_match.group(1).strip()
+        # 6. Dates
+        open_m = re.search(r'(?:BID/ISSUE\s+OPENS?|OPENS?\s+ON)\s*[:\-]?\s*([A-Za-z0-9\s,]+?\d{4})', cover_15, re.IGNORECASE)
+        if open_m:
+            fields["open_date"] = open_m.group(1).strip().replace('\n', ' ')
 
-        close_match = re.search(r'(?:BID/ISSUE\s+CLOSES?|CLOSES?\s+ON)\s*[:\-]?\s*([A-Za-z0-9\s,]+?\d{4})', cover_text, re.IGNORECASE)
-        if close_match:
-            fields["close_date"] = close_match.group(1).strip()
+        close_m = re.search(r'(?:BID/ISSUE\s+CLOSES?|CLOSES?\s+ON)\s*[:\-]?\s*([A-Za-z0-9\s,]+?\d{4})', cover_15, re.IGNORECASE)
+        if close_m:
+            fields["close_date"] = close_m.group(1).strip().replace('\n', ' ')
 
-        # 7. Lead Managers & Registrar
-        lm_match = re.search(r'BOOK\s+RUNNING\s+LEAD\s+MANAGER[S]?\s*[:\-]?\s*([^\n]+)', cover_text, re.IGNORECASE)
-        if lm_match:
-            fields["lead_managers"] = lm_match.group(1).strip()
+        # 7. Issuer & Registrar Contacts from "GENERAL INFORMATION" section
+        gen_pg = self.toc_map.get("GENERAL_INFO")
+        if not gen_pg:
+            for pg in range(min(20, len(self.doc))):
+                if "GENERAL INFORMATION" in self.doc[pg].get_text().upper():
+                    gen_pg = pg + 1
+                    break
 
-        reg_match = re.search(r'REGISTRAR\s+TO\s+THE\s+ISSUE\s*[:\-]?\s*([^\n]+)', cover_text, re.IGNORECASE)
-        if reg_match:
-            fields["registrar"] = reg_match.group(1).strip()
+        if gen_pg and gen_pg <= len(self.doc):
+            gen_text = ""
+            for p in range(gen_pg - 1, min(gen_pg + 5, len(self.doc))):
+                gen_text += self.doc[p].get_text() + "\n"
 
-        return fields
+            email_m = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', gen_text)
+            if email_m:
+                filtered_emails = [e for e in email_m if "sebi.gov.in" not in e.lower() and "bseindia" not in e.lower()]
+                if filtered_emails:
+                    fields["company_email"] = filtered_emails[0]
+                    if len(filtered_emails) > 1:
+                        fields["registrar_email"] = filtered_emails[1]
 
-    def stage_2_basis_for_issue_price(self) -> Dict[str, Any]:
-        """Parser for SEBI-mandated 'BASIS FOR ISSUE PRICE' table (EPS, P/E, ROCE)."""
-        fields = {}
-        basis_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "PEER GROUP COMPARISON"], max_pages=6)
-        
-        if basis_text:
-            eps_match = re.search(r'Basic\s+EPS[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
-            if eps_match:
-                fields["eps_pre"] = eps_match.group(1)
-            
-            eps_post_match = re.search(r'Diluted\s+EPS[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
-            if eps_post_match:
-                fields["eps_post"] = eps_post_match.group(1)
+            phone_m = re.findall(r'(?:\+91|0)?\d[\d\s\-]{8,14}\d', gen_text)
+            if phone_m:
+                fields["company_phone"] = phone_m[0].strip()
 
-            pe_match = re.search(r'P/E\s+Ratio[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
-            if pe_match:
-                fields["pe_pre"] = pe_match.group(1)
-                fields["pe_post"] = pe_match.group(1)
-
-            ronw_match = re.search(r'(?:Return\s+on\s+Net\s+Worth|RoNW|ROCE)[^\n]*?(\d+(?:\.\d+)?)\s*%', basis_text, re.IGNORECASE)
-            if ronw_match:
-                fields["roce"] = ronw_match.group(1)
-
-        # Lot Size and Issue Size scanning across full document
-        for page_num in range(min(120, len(self.doc))):
-            text = self.doc[page_num].get_text()
-            
-            if "lot_size" not in fields and "lot_size" not in self.extracted_fields:
-                lot_match = re.search(r'(?:Minimum\s+Bid\s+Quantity|Lot\s+Size|bid\s+for\s+at\s+least)[^\n]*?(\d+)\s*(?:Equity\s+Shares|shares)?', text, re.IGNORECASE)
-                if not lot_match:
-                    lot_match = re.search(r'(\d+)\s*(?:Equity\s+Shares|shares)\s*(?:and\s+in\s+multiples|thereafter)', text, re.IGNORECASE)
-                if lot_match and int(lot_match.group(1)) > 0:
-                    fields["lot_size"] = lot_match.group(1)
-                    self.confidence["lot_size"] = 0.93
-
-            if "issue_size" not in fields and "issue_size" not in self.extracted_fields:
-                size_match = re.search(fr'aggregating\s+up\s+to\s+{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)\s*(?:Cr|Crore|Million|Lakh)', text, re.IGNORECASE)
-                if size_match:
-                    fields["issue_size"] = size_match.group(1)
+            web_m = re.findall(r'(?:https?://[^\s]+|www\.[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', gen_text)
+            if web_m:
+                fields["company_website"] = web_m[0].strip()
 
         return fields
 
-    def stage_3_general_information(self) -> Dict[str, Any]:
-        """Context-anchored extraction within 'GENERAL INFORMATION' section."""
+    def stage_3_table_finder_financials(self) -> Dict[str, Any]:
+        """Parses 'BASIS FOR ISSUE PRICE' & 'CAPITAL STRUCTURE' tables via PyMuPDF TableFinder."""
         fields = {}
-        gen_info_text = ""
-        
-        for i, page in enumerate(self.doc):
-            text = page.get_text()
-            if "GENERAL INFORMATION" in text.upper():
-                for j in range(i, min(i + 6, len(self.doc))):
-                    gen_info_text += self.doc[j].get_text() + "\n"
-                break
-                
-        if gen_info_text:
-            issuer_block = re.search(r'(?:REGISTERED OFFICE|ISSUER DETAILS)([\s\S]*?)(?:REGISTRAR|BOOK RUNNING)', gen_info_text, re.IGNORECASE)
-            if issuer_block:
-                block_txt = issuer_block.group(1)
-                phone = re.search(r'(?:Tel|Phone|Telephone)\s*[:\-]?\s*(\+?\d[\d\s\-]{8,15})', block_txt, re.IGNORECASE)
-                email = re.search(r'(?:E-?mail)\s*[:\-]?\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', block_txt, re.IGNORECASE)
-                web = re.search(r'(?:Website|Web)\s*[:\-]?\s*(https?://[^\s]+|www\.[^\s]+)', block_txt, re.IGNORECASE)
-                
-                if phone: fields["company_phone"] = phone.group(1).strip()
-                if email: fields["company_email"] = email.group(1).strip()
-                if web: fields["company_website"] = web.group(1).strip()
 
-            reg_block = re.search(r'REGISTRAR TO THE ISSUE([\s\S]*?)(?:COMPANY SECRETARY|COMPLIANCE|LEAD MANAGER)', gen_info_text, re.IGNORECASE)
-            if reg_block:
-                block_txt = reg_block.group(1)
-                phone = re.search(r'(?:Tel|Phone|Telephone)\s*[:\-]?\s*(\+?\d[\d\s\-]{8,15})', block_txt, re.IGNORECASE)
-                email = re.search(r'(?:E-?mail)\s*[:\-]?\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', block_txt, re.IGNORECASE)
-                web = re.search(r'(?:Website|Web)\s*[:\-]?\s*(https?://[^\s]+|www\.[^\s]+)', block_txt, re.IGNORECASE)
-                
-                if phone: fields["registrar_phone"] = phone.group(1).strip()
-                if email: fields["registrar_email"] = email.group(1).strip()
-                if web: fields["registrar_website"] = web.group(1).strip()
+        # 1. Basis for Issue Price Tables
+        basis_pg = self.toc_map.get("BASIS_FOR_PRICE")
+        if not basis_pg:
+            for pg in range(min(150, len(self.doc))):
+                if "BASIS FOR ISSUE PRICE" in self.doc[pg].get_text().upper() or "BASIS FOR OFFER PRICE" in self.doc[pg].get_text().upper():
+                    basis_pg = pg + 1
+                    break
+
+        if basis_pg and basis_pg <= len(self.doc):
+            for p in range(basis_pg - 1, min(basis_pg + 5, len(self.doc))):
+                tabs = self.doc[p].find_tables()
+                if tabs and tabs.tables:
+                    for t in tabs.tables:
+                        grid = t.extract()
+                        for row in grid:
+                            row_txt = " ".join([str(c).strip() for c in row if c])
+                            
+                            if "Basic EPS" in row_txt and "eps_pre" not in fields:
+                                num_m = re.search(r'(\d+(?:\.\d+)?)', row_txt)
+                                if num_m: fields["eps_pre"] = num_m.group(1)
+                                
+                            if "Diluted EPS" in row_txt and "eps_post" not in fields:
+                                num_m = re.search(r'(\d+(?:\.\d+)?)', row_txt)
+                                if num_m: fields["eps_post"] = num_m.group(1)
+
+                            if ("P/E Ratio" in row_txt or "P/E at" in row_txt) and "pe_pre" not in fields:
+                                num_m = re.search(r'(\d+(?:\.\d+)?)', row_txt)
+                                if num_m: 
+                                    fields["pe_pre"] = num_m.group(1)
+                                    fields["pe_post"] = num_m.group(1)
+
+                            if ("Return on Net Worth" in row_txt or "RoNW" in row_txt or "ROCE" in row_txt) and "roce" not in fields:
+                                num_m = re.search(r'(\d+(?:\.\d+)?)\s*%', row_txt)
+                                if num_m: fields["roce"] = num_m.group(1)
+
+        # 2. Capital Structure Category Reservations (QIB, NII, RII)
+        cap_pg = self.toc_map.get("CAPITAL_STRUCTURE")
+        if not cap_pg:
+            for pg in range(min(100, len(self.doc))):
+                if "CAPITAL STRUCTURE" in self.doc[pg].get_text().upper():
+                    cap_pg = pg + 1
+                    break
+
+        if cap_pg and cap_pg <= len(self.doc):
+            cap_text = ""
+            for p in range(cap_pg - 1, min(cap_pg + 4, len(self.doc))):
+                cap_text += self.doc[p].get_text() + "\n"
+
+            qib_m = re.search(r'(?:QIB|Qualified\s+Institutional)[^\n]*?(\d+(?:\.\d+)?)\s*%', cap_text, re.IGNORECASE)
+            nii_m = re.search(r'(?:NII|Non\-Institutional|NIB)[^\n]*?(\d+(?:\.\d+)?)\s*%', cap_text, re.IGNORECASE)
+            rii_m = re.search(r'(?:RII|Retail\s+Individual|RIB)[^\n]*?(\d+(?:\.\d+)?)\s*%', cap_text, re.IGNORECASE)
+
+            if qib_m: fields["reservation_qib"] = qib_m.group(1)
+            if nii_m: fields["reservation_nii"] = nii_m.group(1)
+            if rii_m: fields["reservation_rii"] = rii_m.group(1)
 
         return fields
 
-    async def call_groq_ai(self, prompt: str, model_name: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
-        """Calls Groq API with 429 rate limit backoff and fallback model support."""
-        if not self.groq_key:
-            return {}
-        
-        models_to_try = [model_name, "llama-3.1-8b-instant"]
-        
-        for model in models_to_try:
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {self.groq_key}"},
-                        json={
-                            "model": model,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.1,
-                            "response_format": {"type": "json_object"}
-                        },
-                        timeout=30.0
-                    )
-                    if res.status_code == 200:
-                        data = res.json()
-                        content = data["choices"][0]["message"]["content"]
-                        return json.loads(content)
-                    elif res.status_code == 429:
-                        print(f"[AI Rate Limit 429]: Model {model} hit limit. Retrying with fallback model after short delay...")
-                        await asyncio.sleep(2.5)
-                        continue
-                    else:
-                        print(f"[AI Warning]: Groq ({model}) status {res.status_code}: {res.text[:150]}")
-            except Exception as e:
-                print(f"[AI Error] ({model}): {e}")
-                
-        return {}
-
-    async def stage_4_investor_narratives(self, supabase_client: Any) -> Dict[str, Any]:
-        """Financial Analyst Persona AI prompts for investor-grade narratives."""
-        if not self.groq_key:
-            print("[Stage 4 AI Note]: GROQ_API_KEY is missing in environment.")
-            return {}
-
+    def stage_4_structural_paragraph_slicer(self) -> Dict[str, Any]:
+        """Slices clean introductory business & objective paragraphs from PDF text."""
         fields = {}
 
-        # 1. Prompt A: Cover & Offer Details
-        cover_text = self.get_combined_page_text(0, 15)
-        terms_text = self.find_pages_with_keywords(["PRICE BAND", "LOT SIZE", "MINIMUM BID", "TERMS OF THE ISSUE"])
-        
-        prompt_cover = (
-            "You are a senior IPO analyst. Extract IPO parameters from this RHP text.\n"
-            "Return a JSON object with these exact keys (use null if not found):\n"
-            "{\n"
-            '  "name": "Full legal company name",\n'
-            '  "exchange": "NSE, BSE or NSE, BSE",\n'
-            '  "price_min": "Lower price band number",\n'
-            '  "price_max": "Upper price band number",\n'
-            '  "lot_size": "Lot size bid quantity number",\n'
-            '  "face_value": "Face value number",\n'
-            '  "issue_size": "Total issue size in Crores",\n'
-            '  "fresh_issue": "Fresh issue component in Crores",\n'
-            '  "open_date": "Issue opening date YYYY-MM-DD",\n'
-            '  "close_date": "Issue closing date YYYY-MM-DD",\n'
-            '  "lead_managers": "Book running lead managers",\n'
-            '  "registrar": "Registrar to the issue"\n'
-            "}\n\n"
-            f"RHP Text:\n{cover_text[:8000]}\n{terms_text[:8000]}"
-        )
-        res_a = await self.call_groq_ai(prompt_cover)
-        for k, v in res_a.items():
-            if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
-                fields[k] = str(v)
+        # 1. About Company (from "OUR BUSINESS" section)
+        biz_pg = self.toc_map.get("BUSINESS")
+        if not biz_pg:
+            for pg in range(min(250, len(self.doc))):
+                if "OUR BUSINESS" in self.doc[pg].get_text().upper():
+                    biz_pg = pg + 1
+                    break
 
-        await asyncio.sleep(2.0)  # Delay between AI prompts to avoid TPM rate limits
+        if biz_pg and biz_pg <= len(self.doc):
+            biz_text = self.doc[biz_pg - 1].get_text()
+            paragraphs = [p.strip().replace('\n', ' ') for p in biz_text.split('\n\n') if len(p.strip()) > 80]
+            if paragraphs:
+                fields["about_company"] = paragraphs[0][:600]
 
-        # 2. Prompt B: Investor-Grade "About Company" Summary (Financial Analyst Persona)
-        biz_text = self.find_pages_with_keywords(["OUR BUSINESS", "BUSINESS OVERVIEW"], max_pages=3)
-        if biz_text:
-            prompt_about = (
-                "You are a senior equity research analyst writing for retail and HNI IPO investors.\n"
-                "Summarize the company's business in 2-3 crisp, high-value sentences based on this RHP text.\n\n"
-                "CRITICAL INSTRUCTIONS:\n"
-                "1. Focus ON: Primary business model, key products/services, manufacturing/operational scale (capacity, plants, units), revenue drivers, and market position.\n"
-                "2. DO NOT INCLUDE: Incorporation date, registered address, CIN number, legal status, or SEBI disclaimers.\n"
-                "3. Format JSON: {\"about_company\": \"...\"}\n\n"
-                f"RHP Business Text:\n{biz_text[:8000]}"
-            )
-            res_b = await self.call_groq_ai(prompt_about)
-            if "about_company" in res_b and res_b["about_company"]:
-                fields["about_company"] = str(res_b["about_company"])
+        # 2. Objects of the Issue
+        obj_pg = self.toc_map.get("OBJECTS")
+        if not obj_pg:
+            for pg in range(min(150, len(self.doc))):
+                if "OBJECTS OF THE ISSUE" in self.doc[pg].get_text().upper() or "OBJECTS OF THE OFFER" in self.doc[pg].get_text().upper():
+                    obj_pg = pg + 1
+                    break
 
-        await asyncio.sleep(2.0)  # Delay to prevent TPM limits
-
-        # 3. Prompt C: Key Business Risks (Top 5 Business/Operational Risks)
-        risk_text = self.find_pages_with_keywords(["SUMMARY OF RISK FACTORS", "RISK FACTORS"], max_pages=3)
-        if risk_text:
-            prompt_risks = (
-                "You are an IPO risk analyst. Extract the top 4-5 business & operational risks for an investor.\n"
-                "CRITICAL: Exclude generic macro risks (e.g. 'changes in government policy', 'general economic slowdown').\n"
-                "Focus on: customer concentration, supplier reliance, debt levels, regulatory approvals, or product risks.\n"
-                "Format JSON: {\"company_risks\": \"1. Risk one\\n2. Risk two\\n3. Risk three\"}\n\n"
-                f"RHP Risk Text:\n{risk_text[:8000]}"
-            )
-            res_c = await self.call_groq_ai(prompt_risks)
-            if "company_risks" in res_c and res_c["company_risks"]:
-                fields["company_risks"] = str(res_c["company_risks"])
-
-        await asyncio.sleep(2.0)
-
-        # 4. Prompt D: Objectives & Financial Metrics
-        fin_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "SHAREHOLDING PATTERN", "OBJECTS OF THE ISSUE"])
-        if fin_text:
-            prompt_fin = (
-                "Extract IPO financial metrics and objects from this RHP text. Return a JSON object with these keys (use null if not found):\n"
-                "{\n"
-                '  "objectives": "Numbered list of fund utilization plans",\n'
-                '  "eps_pre": "Pre-issue EPS number",\n'
-                '  "eps_post": "Post-issue EPS number",\n'
-                '  "pe_pre": "Pre-issue P/E ratio number",\n'
-                '  "pe_post": "Post-issue P/E ratio number",\n'
-                '  "promoter_holding_pre": "Pre-issue promoter % number",\n'
-                '  "promoter_holding_post": "Post-issue promoter % number",\n'
-                '  "reservation_qib": "QIB reservation % number",\n'
-                '  "reservation_nii": "NII reservation % number",\n'
-                '  "reservation_rii": "Retail reservation % number",\n'
-                '  "roce": "ROCE % number",\n'
-                '  "pat_margin": "PAT Margin % number"\n'
-                "}\n\n"
-                f"RHP Text:\n{fin_text[:8000]}"
-            )
-            res_d = await self.call_groq_ai(prompt_fin)
-            for k, v in res_d.items():
-                if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
-                    fields[k] = str(v)
+        if obj_pg and obj_pg <= len(self.doc):
+            obj_text = self.doc[obj_pg - 1].get_text()
+            bullets = re.findall(r'(?:^\d+[\.\)]\s*|\b[a-z][\.\)]\s*)([^\n]{15,120})', obj_text, re.MULTILINE)
+            if bullets:
+                fields["objectives"] = "\n".join([f"{i+1}. {b.strip()}" for i, b in enumerate(bullets[:4])])
 
         return fields
 
@@ -406,26 +330,27 @@ class RhpExtractor:
                 if any(alias in reg_name.upper() for alias in aliases):
                     if not self.extracted_fields.get("registrar_phone") and row.get("phone"):
                         self.extracted_fields["registrar_phone"] = row["phone"]
-                        self.confidence["registrar_phone"] = 0.90
                     if not self.extracted_fields.get("registrar_email") and row.get("email"):
                         self.extracted_fields["registrar_email"] = row["email"]
-                        self.confidence["registrar_email"] = 0.90
+                    if not self.extracted_fields.get("registrar_website") and row.get("website"):
+                        self.extracted_fields["registrar_website"] = row["website"]
                     break
         except Exception as e:
             print(f"[Registrar Verification Error]: {e}")
 
     async def run_pipeline(self, job_id: str, supabase_client: Any) -> Dict[str, Any]:
-        """Run all extraction stages with progressive partial updates to Supabase."""
+        """Run 100% In-House Zero-AI extraction pipeline (0ms API cost, 100% local)."""
         self.stage_0_triage()
         
-        # Stage 1: Cover Page
-        s1 = self.stage_1_cover_page()
-        self.extracted_fields.update(s1)
+        # Stage 1: Build SEBI TOC Map
+        self.stage_1_toc_map_engine()
 
-        # Stage 2 & 3: Basis for Issue Price + General Information Contacts
-        s2 = self.stage_2_basis_for_issue_price()
-        s3 = self.stage_3_general_information()
+        # Stage 2: Cover Page & Issuer/Registrar Contacts
+        s2 = self.stage_2_cover_page_and_contacts()
         self.extracted_fields.update(s2)
+
+        # Stage 3: TableFinder Financial Grid Parser
+        s3 = self.stage_3_table_finder_financials()
         self.extracted_fields.update(s3)
 
         if supabase_client:
@@ -433,14 +358,14 @@ class RhpExtractor:
                 "partial_result": {**self.extracted_fields, "stage": 3}
             }).eq("id", job_id).execute()
 
-        # Verification against Supabase database
+        # Registrar Database Verification
         self.verify_registrar(supabase_client)
 
-        # Stage 4: Investor-Grade AI Narrative Prompts
-        s4 = await self.stage_4_investor_narratives(supabase_client)
+        # Stage 4: Structural Paragraph Slicer (Narrative Overview)
+        s4 = self.stage_4_structural_paragraph_slicer()
         self.extracted_fields.update(s4)
 
-        # SEBI Lot Math (100% Deterministic)
+        # Stage 5: SEBI Lot Math (100% Deterministic)
         p_max = float(self.extracted_fields.get("price_max") or 0)
         l_size = float(self.extracted_fields.get("lot_size") or 0)
         if p_max > 0 and l_size > 0:
