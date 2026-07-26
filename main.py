@@ -61,6 +61,8 @@ async def worker_loop():
                 extractor = RhpExtractor(pdf_bytes, groq_api_key=GROQ_API_KEY)
                 pipeline_result = await extractor.run_pipeline(job_id, supabase)
 
+                print(f"📊 Extracted {len(pipeline_result['fields'])} fields for Job {job_id}: {list(pipeline_result['fields'].keys())}")
+
                 # Update job as completed
                 supabase.table("extraction_jobs").update({
                     "status": "done",
