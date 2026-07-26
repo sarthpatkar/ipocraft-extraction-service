@@ -66,6 +66,7 @@ async def worker_loop():
                 # Update job as completed
                 supabase.table("extraction_jobs").update({
                     "status": "done",
+                    "schema_version": 2,
                     "result": pipeline_result["fields"],
                     "confidence": pipeline_result["confidence"],
                     "warnings": pipeline_result["warnings"],

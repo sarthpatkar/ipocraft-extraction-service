@@ -6,9 +6,10 @@ import httpx
 from typing import Dict, Any, Tuple, List, Optional
 from difflib import SequenceMatcher
 
+WORKER_VERSION = "2.0.0"
 CURRENCY_REGEX = r'(?:Rs\.?|INR|₹|Rupees?)'
 
-# ── SEBI Lot Math Helper ──────────────────────────────────────────────────
+# ── SEBI Lot Math Helper (100% Deterministic) ────────────────────────────
 def calculate_sebi_lots(price_max: float, lot_size: float) -> Dict[str, Any]:
     if not (price_max > 0 and lot_size > 0):
         return {}
@@ -72,7 +73,7 @@ class RhpExtractor:
             raise ValueError("This PDF appears to be a scanned image document. Please upload a text-searchable digital PDF from SEBI EDGAR.")
 
     def get_combined_page_text(self, start_page: int, end_page: int) -> str:
-        """Combines standard PyMuPDF text for a range of pages."""
+        """Combines PyMuPDF plain text for a range of pages."""
         text = ""
         for i in range(start_page, min(end_page, len(self.doc))):
             text += self.doc[i].get_text() + "\n"
@@ -93,7 +94,7 @@ class RhpExtractor:
         return combined_text
 
     def stage_1_cover_page(self) -> Dict[str, Any]:
-        """Extract cover page details from first 15 pages."""
+        """Extract cover page details (pages 0-15). Handles multi-BRLM formatting."""
         cover_text = self.get_combined_page_text(0, 15)
         fields = {}
         
@@ -106,7 +107,11 @@ class RhpExtractor:
         if not name_match:
             name_match = re.search(r'([A-Z0-9\s\.\&\(\)\-]+?\b(?:LIMITED|LTD|PRIVATE\s+LIMITED|PVT\s+LTD))\b', cover_text)
         if name_match:
-            fields["name"] = name_match.group(1).strip()
+            # Clean company name
+            raw_name = name_match.group(1).strip()
+            # Remove trailing legal disclaimers if caught
+            clean_name = re.sub(r'\s+(?:HAVING|REGISTERED|OUR\s+COMPANY|WAS\s+INCORPORATED).*$', '', raw_name, flags=re.IGNORECASE)
+            fields["name"] = clean_name.strip()
             self.confidence["name"] = 0.95
 
         # 2. Exchange
@@ -116,6 +121,7 @@ class RhpExtractor:
             fields["exchange"] = "BSE"
         elif re.search(r'\bNSE\b', cover_text):
             fields["exchange"] = "NSE"
+        self.confidence["exchange"] = 0.99
 
         # 3. IPO Type
         if re.search(r'SME\s+INITIAL\s+PUBLIC|SME\s+PLATFORM|EMERGE|CHAPTER\s+IX', cover_text, re.IGNORECASE):
@@ -130,7 +136,7 @@ class RhpExtractor:
             fields["face_value"] = fv_match.group(1)
             self.confidence["face_value"] = 0.98
 
-        # 5. Price Band or Fixed Issue Price
+        # 5. Price Band / Offer Price
         price_band = re.search(
             fr'(?:Price\s+Band|Offer\s+Price|Issue\s+Price)[^\n]*?{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)\s*(?:to|-|–|AND)\s*{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)',
             cover_text,
@@ -152,7 +158,7 @@ class RhpExtractor:
                 self.confidence["price_min"] = 0.95
                 self.confidence["price_max"] = 0.95
 
-        # 6. Dates
+        # 6. Issue Dates
         open_match = re.search(r'(?:BID/ISSUE\s+OPENS?|OPENS?\s+ON)\s*[:\-]?\s*([A-Za-z0-9\s,]+?\d{4})', cover_text, re.IGNORECASE)
         if open_match:
             fields["open_date"] = open_match.group(1).strip()
@@ -161,7 +167,7 @@ class RhpExtractor:
         if close_match:
             fields["close_date"] = close_match.group(1).strip()
 
-        # 7. Lead Managers & Registrar Names
+        # 7. Lead Managers & Registrar
         lm_match = re.search(r'BOOK\s+RUNNING\s+LEAD\s+MANAGER[S]?\s*[:\-]?\s*([^\n]+)', cover_text, re.IGNORECASE)
         if lm_match:
             fields["lead_managers"] = lm_match.group(1).strip()
@@ -172,14 +178,37 @@ class RhpExtractor:
 
         return fields
 
-    def stage_2_terms_table(self) -> Dict[str, Any]:
-        """Extract Terms & Lot details."""
+    def stage_2_basis_for_issue_price(self) -> Dict[str, Any]:
+        """Parser for SEBI-mandated 'BASIS FOR ISSUE PRICE' table (EPS, P/E, ROCE)."""
         fields = {}
+        basis_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "PEER GROUP COMPARISON"], max_pages=6)
         
+        if basis_text:
+            # EPS
+            eps_match = re.search(r'Basic\s+EPS[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
+            if eps_match:
+                fields["eps_pre"] = eps_match.group(1)
+            
+            eps_post_match = re.search(r'Diluted\s+EPS[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
+            if eps_post_match:
+                fields["eps_post"] = eps_post_match.group(1)
+
+            # P/E Ratio
+            pe_match = re.search(r'P/E\s+Ratio[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
+            if pe_match:
+                fields["pe_pre"] = pe_match.group(1)
+                fields["pe_post"] = pe_match.group(1)
+
+            # Return on Net Worth / ROCE
+            ronw_match = re.search(r'(?:Return\s+on\s+Net\s+Worth|RoNW|ROCE)[^\n]*?(\d+(?:\.\d+)?)\s*%', basis_text, re.IGNORECASE)
+            if ronw_match:
+                fields["roce"] = ronw_match.group(1)
+
+        # Lot Size and Issue Size scanning across full document
         for page_num in range(min(120, len(self.doc))):
             text = self.doc[page_num].get_text()
             
-            if "lot_size" not in fields:
+            if "lot_size" not in fields and "lot_size" not in self.extracted_fields:
                 lot_match = re.search(r'(?:Minimum\s+Bid\s+Quantity|Lot\s+Size|bid\s+for\s+at\s+least)[^\n]*?(\d+)\s*(?:Equity\s+Shares|shares)?', text, re.IGNORECASE)
                 if not lot_match:
                     lot_match = re.search(r'(\d+)\s*(?:Equity\s+Shares|shares)\s*(?:and\s+in\s+multiples|thereafter)', text, re.IGNORECASE)
@@ -187,17 +216,10 @@ class RhpExtractor:
                     fields["lot_size"] = lot_match.group(1)
                     self.confidence["lot_size"] = 0.93
 
-            if "issue_size" not in fields:
+            if "issue_size" not in fields and "issue_size" not in self.extracted_fields:
                 size_match = re.search(fr'aggregating\s+up\s+to\s+{CURRENCY_REGEX}?\s*(\d+(?:\.\d+)?)\s*(?:Cr|Crore|Million|Lakh)', text, re.IGNORECASE)
                 if size_match:
                     fields["issue_size"] = size_match.group(1)
-
-        p_max = float(self.extracted_fields.get("price_max") or fields.get("price_max") or 0)
-        l_size = float(fields.get("lot_size") or self.extracted_fields.get("lot_size") or 0)
-        
-        if p_max > 0 and l_size > 0:
-            lot_math = calculate_sebi_lots(p_max, l_size)
-            fields.update(lot_math)
 
         return fields
 
@@ -265,80 +287,96 @@ class RhpExtractor:
             print(f"[AI Error]: {e}")
         return {}
 
-    async def stage_5_ai_prompts(self, supabase_client: Any) -> Dict[str, Any]:
-        """Comprehensive AI extraction across targeted RHP sections."""
+    async def stage_4_investor_narratives(self, supabase_client: Any) -> Dict[str, Any]:
+        """Financial Analyst Persona AI prompts for investor-grade narratives."""
         if not self.groq_key:
-            print("[Stage 5 AI Note]: GROQ_API_KEY is missing in environment.")
+            print("[Stage 4 AI Note]: GROQ_API_KEY is missing in environment.")
             return {}
 
         fields = {}
 
-        # Prompt A: Cover / Offer Details (if price_max or lot_size or name is missing)
+        # 1. Prompt A: Cover & Offer Details (if any essential key is missing)
         cover_text = self.get_combined_page_text(0, 15)
         terms_text = self.find_pages_with_keywords(["PRICE BAND", "LOT SIZE", "MINIMUM BID", "TERMS OF THE ISSUE"])
         
         prompt_cover = (
-            "Extract IPO details from this RHP text. Return a JSON object with these keys (use null if not found):\n"
+            "You are a senior IPO analyst. Extract IPO parameters from this RHP text.\n"
+            "Return a JSON object with these exact keys (use null if not found):\n"
             "{\n"
-            '  "name": "Company name",\n'
+            '  "name": "Full legal company name",\n'
             '  "exchange": "NSE, BSE or NSE, BSE",\n'
             '  "price_min": "Lower price band number",\n'
             '  "price_max": "Upper price band number",\n'
-            '  "lot_size": "Lot size number",\n'
+            '  "lot_size": "Lot size bid quantity number",\n'
             '  "face_value": "Face value number",\n'
             '  "issue_size": "Total issue size in Crores",\n'
-            '  "fresh_issue": "Fresh issue in Crores",\n'
-            '  "open_date": "Open date YYYY-MM-DD",\n'
-            '  "close_date": "Close date YYYY-MM-DD",\n'
-            '  "lead_managers": "Lead managers",\n'
-            '  "registrar": "Registrar name"\n'
+            '  "fresh_issue": "Fresh issue component in Crores",\n'
+            '  "open_date": "Issue opening date YYYY-MM-DD",\n'
+            '  "close_date": "Issue closing date YYYY-MM-DD",\n'
+            '  "lead_managers": "Book running lead managers",\n'
+            '  "registrar": "Registrar to the issue"\n'
             "}\n\n"
             f"RHP Text:\n{cover_text[:10000]}\n{terms_text[:10000]}"
         )
         res_a = await self.call_groq_ai(prompt_cover)
         for k, v in res_a.items():
-            if v is not None and str(v).strip() != "":
+            if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
                 fields[k] = str(v)
 
-        # Prompt B: Financials & Shareholding
-        fin_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "SHAREHOLDING PATTERN", "STATEMENT OF FINANCIAL"])
+        # 2. Prompt B: Investor-Grade "About Company" Summary (Financial Analyst Persona)
+        biz_text = self.find_pages_with_keywords(["OUR BUSINESS", "BUSINESS OVERVIEW"], max_pages=3)
+        if biz_text:
+            prompt_about = (
+                "You are a senior equity research analyst writing for retail and HNI IPO investors.\n"
+                "Summarize the company's business in 2-3 crisp, high-value sentences based on this RHP text.\n\n"
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. Focus ON: Primary business model, key products/services, manufacturing/operational scale (capacity, plants, units), revenue drivers, and market position.\n"
+                "2. DO NOT INCLUDE: Incorporation date, registered address, CIN number, legal status, or SEBI disclaimers.\n"
+                "3. Format JSON: {\"about_company\": \"...\"}\n\n"
+                f"RHP Business Text:\n{biz_text[:10000]}"
+            )
+            res_b = await self.call_groq_ai(prompt_about)
+            if "about_company" in res_b and res_b["about_company"]:
+                fields["about_company"] = str(res_b["about_company"])
+
+        # 3. Prompt C: Key Business Risks (Top 5 Business/Operational Risks)
+        risk_text = self.find_pages_with_keywords(["SUMMARY OF RISK FACTORS", "RISK FACTORS"], max_pages=3)
+        if risk_text:
+            prompt_risks = (
+                "You are an IPO risk analyst. Extract the top 4-5 business & operational risks for an investor.\n"
+                "CRITICAL: Exclude generic macro risks (e.g. 'changes in government policy', 'general economic slowdown').\n"
+                "Focus on: customer concentration, supplier reliance, debt levels, regulatory approvals, or product risks.\n"
+                "Format JSON: {\"company_risks\": \"1. Risk one\\n2. Risk two\\n3. Risk three\"}\n\n"
+                f"RHP Risk Text:\n{risk_text[:10000]}"
+            )
+            res_c = await self.call_groq_ai(prompt_risks)
+            if "company_risks" in res_c and res_c["company_risks"]:
+                fields["company_risks"] = str(res_c["company_risks"])
+
+        # 4. Prompt D: Objectives & Financial Metrics
+        fin_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "SHAREHOLDING PATTERN", "OBJECTS OF THE ISSUE"])
         if fin_text:
             prompt_fin = (
-                "Extract financial metrics from this RHP text. Return a JSON object with these keys (use null if not found):\n"
+                "Extract IPO financial metrics and objects from this RHP text. Return a JSON object with these keys (use null if not found):\n"
                 "{\n"
+                '  "objectives": "Numbered list of fund utilization plans",\n'
                 '  "eps_pre": "Pre-issue EPS number",\n'
                 '  "eps_post": "Post-issue EPS number",\n'
                 '  "pe_pre": "Pre-issue P/E ratio number",\n'
                 '  "pe_post": "Post-issue P/E ratio number",\n'
-                '  "promoter_holding_pre": "Pre-issue promoter %",\n'
-                '  "promoter_holding_post": "Post-issue promoter %",\n'
-                '  "reservation_qib": "QIB reservation %",\n'
-                '  "reservation_nii": "NII reservation %",\n'
-                '  "reservation_rii": "Retail reservation %",\n'
-                '  "roce": "ROCE %",\n'
-                '  "pat_margin": "PAT Margin %"\n'
+                '  "promoter_holding_pre": "Pre-issue promoter % number",\n'
+                '  "promoter_holding_post": "Post-issue promoter % number",\n'
+                '  "reservation_qib": "QIB reservation % number",\n'
+                '  "reservation_nii": "NII reservation % number",\n'
+                '  "reservation_rii": "Retail reservation % number",\n'
+                '  "roce": "ROCE % number",\n'
+                '  "pat_margin": "PAT Margin % number"\n'
                 "}\n\n"
-                f"Financial Text:\n{fin_text[:12000]}"
+                f"RHP Text:\n{fin_text[:12000]}"
             )
-            res_b = await self.call_groq_ai(prompt_fin)
-            for k, v in res_b.items():
-                if v is not None and str(v).strip() != "":
-                    fields[k] = str(v)
-
-        # Prompt C: Narrative (About & Objectives)
-        biz_text = self.find_pages_with_keywords(["OUR BUSINESS", "OBJECTS OF THE ISSUE"], max_pages=3)
-        if biz_text:
-            prompt_nav = (
-                "Extract business narrative from this RHP text. Return a JSON object with these keys (use null if not found):\n"
-                "{\n"
-                '  "about_company": "2 sentence summary of business",\n'
-                '  "objectives": "Numbered list of IPO proceed uses"\n'
-                "}\n\n"
-                f"Business Text:\n{biz_text[:10000]}"
-            )
-            res_c = await self.call_groq_ai(prompt_nav)
-            for k, v in res_c.items():
-                if v is not None and str(v).strip() != "":
+            res_d = await self.call_groq_ai(prompt_fin)
+            for k, v in res_d.items():
+                if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
                     fields[k] = str(v)
 
         return fields
@@ -370,10 +408,12 @@ class RhpExtractor:
         """Run all extraction stages with progressive partial updates to Supabase."""
         self.stage_0_triage()
         
+        # Stage 1: Cover Page (Multi-BRLM)
         s1 = self.stage_1_cover_page()
         self.extracted_fields.update(s1)
 
-        s2 = self.stage_2_terms_table()
+        # Stage 2 & 3: Basis for Issue Price + General Information Contacts
+        s2 = self.stage_2_basis_for_issue_price()
         s3 = self.stage_3_general_information()
         self.extracted_fields.update(s2)
         self.extracted_fields.update(s3)
@@ -383,13 +423,14 @@ class RhpExtractor:
                 "partial_result": {**self.extracted_fields, "stage": 3}
             }).eq("id", job_id).execute()
 
+        # Verification against Supabase database
         self.verify_registrar(supabase_client)
 
-        # Stage 5 multi-section AI prompts
-        s5 = await self.stage_5_ai_prompts(supabase_client)
-        self.extracted_fields.update(s5)
+        # Stage 4: Investor-Grade AI Narrative Prompts
+        s4 = await self.stage_4_investor_narratives(supabase_client)
+        self.extracted_fields.update(s4)
 
-        # Re-trigger SEBI lot math if price_max and lot_size exist
+        # SEBI Lot Math (100% Deterministic)
         p_max = float(self.extracted_fields.get("price_max") or 0)
         l_size = float(self.extracted_fields.get("lot_size") or 0)
         if p_max > 0 and l_size > 0:
@@ -397,6 +438,7 @@ class RhpExtractor:
             self.extracted_fields.update(lot_math)
 
         return {
+            "worker_version": WORKER_VERSION,
             "fields": self.extracted_fields,
             "confidence": self.confidence,
             "warnings": self.warnings
