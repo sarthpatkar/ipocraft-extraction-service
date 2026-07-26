@@ -6,7 +6,7 @@ import httpx
 from typing import Dict, Any, Tuple, List, Optional
 from difflib import SequenceMatcher
 
-WORKER_VERSION = "2.0.0"
+WORKER_VERSION = "2.1.0"
 CURRENCY_REGEX = r'(?:Rs\.?|INR|₹|Rupees?)'
 
 # ── SEBI Lot Math Helper (100% Deterministic) ────────────────────────────
@@ -107,9 +107,7 @@ class RhpExtractor:
         if not name_match:
             name_match = re.search(r'([A-Z0-9\s\.\&\(\)\-]+?\b(?:LIMITED|LTD|PRIVATE\s+LIMITED|PVT\s+LTD))\b', cover_text)
         if name_match:
-            # Clean company name
             raw_name = name_match.group(1).strip()
-            # Remove trailing legal disclaimers if caught
             clean_name = re.sub(r'\s+(?:HAVING|REGISTERED|OUR\s+COMPANY|WAS\s+INCORPORATED).*$', '', raw_name, flags=re.IGNORECASE)
             fields["name"] = clean_name.strip()
             self.confidence["name"] = 0.95
@@ -184,7 +182,6 @@ class RhpExtractor:
         basis_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "PEER GROUP COMPARISON"], max_pages=6)
         
         if basis_text:
-            # EPS
             eps_match = re.search(r'Basic\s+EPS[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
             if eps_match:
                 fields["eps_pre"] = eps_match.group(1)
@@ -193,13 +190,11 @@ class RhpExtractor:
             if eps_post_match:
                 fields["eps_post"] = eps_post_match.group(1)
 
-            # P/E Ratio
             pe_match = re.search(r'P/E\s+Ratio[^\n]*?(\d+(?:\.\d+)?)', basis_text, re.IGNORECASE)
             if pe_match:
                 fields["pe_pre"] = pe_match.group(1)
                 fields["pe_post"] = pe_match.group(1)
 
-            # Return on Net Worth / ROCE
             ronw_match = re.search(r'(?:Return\s+on\s+Net\s+Worth|RoNW|ROCE)[^\n]*?(\d+(?:\.\d+)?)\s*%', basis_text, re.IGNORECASE)
             if ronw_match:
                 fields["roce"] = ronw_match.group(1)
@@ -260,31 +255,40 @@ class RhpExtractor:
 
         return fields
 
-    async def call_groq_ai(self, prompt: str) -> Dict[str, Any]:
-        """Calls Groq API and returns parsed JSON object."""
+    async def call_groq_ai(self, prompt: str, model_name: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
+        """Calls Groq API with 429 rate limit backoff and fallback model support."""
         if not self.groq_key:
             return {}
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {self.groq_key}"},
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "response_format": {"type": "json_object"}
-                    },
-                    timeout=30.0
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    content = data["choices"][0]["message"]["content"]
-                    return json.loads(content)
-                else:
-                    print(f"[AI Warning]: Groq status {res.status_code}: {res.text[:150]}")
-        except Exception as e:
-            print(f"[AI Error]: {e}")
+        
+        models_to_try = [model_name, "llama-3.1-8b-instant"]
+        
+        for model in models_to_try:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {self.groq_key}"},
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "response_format": {"type": "json_object"}
+                        },
+                        timeout=30.0
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        content = data["choices"][0]["message"]["content"]
+                        return json.loads(content)
+                    elif res.status_code == 429:
+                        print(f"[AI Rate Limit 429]: Model {model} hit limit. Retrying with fallback model after short delay...")
+                        await asyncio.sleep(2.5)
+                        continue
+                    else:
+                        print(f"[AI Warning]: Groq ({model}) status {res.status_code}: {res.text[:150]}")
+            except Exception as e:
+                print(f"[AI Error] ({model}): {e}")
+                
         return {}
 
     async def stage_4_investor_narratives(self, supabase_client: Any) -> Dict[str, Any]:
@@ -295,7 +299,7 @@ class RhpExtractor:
 
         fields = {}
 
-        # 1. Prompt A: Cover & Offer Details (if any essential key is missing)
+        # 1. Prompt A: Cover & Offer Details
         cover_text = self.get_combined_page_text(0, 15)
         terms_text = self.find_pages_with_keywords(["PRICE BAND", "LOT SIZE", "MINIMUM BID", "TERMS OF THE ISSUE"])
         
@@ -316,12 +320,14 @@ class RhpExtractor:
             '  "lead_managers": "Book running lead managers",\n'
             '  "registrar": "Registrar to the issue"\n'
             "}\n\n"
-            f"RHP Text:\n{cover_text[:10000]}\n{terms_text[:10000]}"
+            f"RHP Text:\n{cover_text[:8000]}\n{terms_text[:8000]}"
         )
         res_a = await self.call_groq_ai(prompt_cover)
         for k, v in res_a.items():
             if v is not None and str(v).strip() != "" and k not in self.extracted_fields:
                 fields[k] = str(v)
+
+        await asyncio.sleep(2.0)  # Delay between AI prompts to avoid TPM rate limits
 
         # 2. Prompt B: Investor-Grade "About Company" Summary (Financial Analyst Persona)
         biz_text = self.find_pages_with_keywords(["OUR BUSINESS", "BUSINESS OVERVIEW"], max_pages=3)
@@ -333,11 +339,13 @@ class RhpExtractor:
                 "1. Focus ON: Primary business model, key products/services, manufacturing/operational scale (capacity, plants, units), revenue drivers, and market position.\n"
                 "2. DO NOT INCLUDE: Incorporation date, registered address, CIN number, legal status, or SEBI disclaimers.\n"
                 "3. Format JSON: {\"about_company\": \"...\"}\n\n"
-                f"RHP Business Text:\n{biz_text[:10000]}"
+                f"RHP Business Text:\n{biz_text[:8000]}"
             )
             res_b = await self.call_groq_ai(prompt_about)
             if "about_company" in res_b and res_b["about_company"]:
                 fields["about_company"] = str(res_b["about_company"])
+
+        await asyncio.sleep(2.0)  # Delay to prevent TPM limits
 
         # 3. Prompt C: Key Business Risks (Top 5 Business/Operational Risks)
         risk_text = self.find_pages_with_keywords(["SUMMARY OF RISK FACTORS", "RISK FACTORS"], max_pages=3)
@@ -347,11 +355,13 @@ class RhpExtractor:
                 "CRITICAL: Exclude generic macro risks (e.g. 'changes in government policy', 'general economic slowdown').\n"
                 "Focus on: customer concentration, supplier reliance, debt levels, regulatory approvals, or product risks.\n"
                 "Format JSON: {\"company_risks\": \"1. Risk one\\n2. Risk two\\n3. Risk three\"}\n\n"
-                f"RHP Risk Text:\n{risk_text[:10000]}"
+                f"RHP Risk Text:\n{risk_text[:8000]}"
             )
             res_c = await self.call_groq_ai(prompt_risks)
             if "company_risks" in res_c and res_c["company_risks"]:
                 fields["company_risks"] = str(res_c["company_risks"])
+
+        await asyncio.sleep(2.0)
 
         # 4. Prompt D: Objectives & Financial Metrics
         fin_text = self.find_pages_with_keywords(["BASIS FOR ISSUE PRICE", "SHAREHOLDING PATTERN", "OBJECTS OF THE ISSUE"])
@@ -372,7 +382,7 @@ class RhpExtractor:
                 '  "roce": "ROCE % number",\n'
                 '  "pat_margin": "PAT Margin % number"\n'
                 "}\n\n"
-                f"RHP Text:\n{fin_text[:12000]}"
+                f"RHP Text:\n{fin_text[:8000]}"
             )
             res_d = await self.call_groq_ai(prompt_fin)
             for k, v in res_d.items():
@@ -408,7 +418,7 @@ class RhpExtractor:
         """Run all extraction stages with progressive partial updates to Supabase."""
         self.stage_0_triage()
         
-        # Stage 1: Cover Page (Multi-BRLM)
+        # Stage 1: Cover Page
         s1 = self.stage_1_cover_page()
         self.extracted_fields.update(s1)
 
